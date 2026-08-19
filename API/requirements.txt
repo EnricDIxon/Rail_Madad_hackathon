@@ -3,3 +3,5 @@ flask-cors
 python-dotenv
 sqlalchemy
 flask-sqlalchemy
+google-generativeai
+pillow

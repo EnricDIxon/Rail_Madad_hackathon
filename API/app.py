@@ -9,6 +9,7 @@ import os
 import re
 import hashlib
 from dotenv import load_dotenv
+import logging
 from werkzeug.utils import secure_filename
 
 
@@ -114,6 +115,60 @@ def analyze_payload(description, train_number=None, coach=None, image_path=None)
     }
 
 
+def call_gemini(description, train_number=None, coach=None, image_path=None):
+    """Attempt to call Gemini via the google.generativeai SDK.
+
+    If the SDK is not installed or the call fails, return None so the caller
+    can fall back to the heuristic `analyze_payload`.
+    """
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return None
+
+    try:
+        # import the common generative AI Python SDK if available
+        
+        from google import generativeai as genai
+
+        genai.configure(api_key=api_key)
+
+        # Build a clear instruction to return structured JSON matching our schema
+        prompt = (
+            "You are an assistant that extracts structured JSON from a passenger complaint. "
+            "Return ONLY a JSON object with keys: category, subcategory, severity, summary, coach, "
+            "detected_objects (array), extracted_text (array), missing_information (array), confidence, department. "
+            f"Complaint text: {description} "
+        )
+
+        # The exact SDK method name varies by version; try generate_text then fallback to chat.
+        try:
+            resp = genai.generate_text(model='chat-bison', input=prompt)
+            text = getattr(resp, 'text', None) or str(resp)
+        except Exception:
+            # try chat-style API
+            resp = genai.chat.create(model='chat-bison', messages=[{'role':'user','content':prompt}])
+            # different response shapes; try to extract message
+            text = None
+            if hasattr(resp, 'candidates'):
+                text = resp.candidates[0].content
+            elif hasattr(resp, 'message'):
+                text = resp.message
+            else:
+                text = str(resp)
+
+        # Attempt to parse JSON from the assistant's reply
+        try:
+            parsed = json.loads(text)
+            return parsed
+        except Exception:
+            app.logger.warning('Gemini returned non-JSON response; falling back to heuristic')
+            return None
+
+    except Exception:
+        app.logger.exception('Gemini integration failed or SDK not installed')
+        return None
+
+
 def compute_group_key(description: str, train_number: str | None, coach: str | None, category: str | None, subcategory: str | None) -> str:
     """Create a deterministic short fingerprint for grouping similar complaints.
 
@@ -179,7 +234,8 @@ def create_complaint():
         # store relative path that frontend can request from /uploads/<filename>
         image_path = f"uploads/{filename}"
 
-    ai = analyze_payload(description, train_number, coach, image_path)
+    # Prefer Gemini analysis when available; fall back to local heuristic
+    ai = call_gemini(description, train_number, coach, image_path) or analyze_payload(description, train_number, coach, image_path)
 
     # compute deterministic group key to identify recurring/duplicate complaints
     group_key = compute_group_key(
@@ -225,8 +281,110 @@ def uploaded_file(filename):
 
 @app.route('/api/complaints', methods=['GET'])
 def list_complaints():
-    complaints = Complaint.query.order_by(Complaint.created_at.desc()).all()
-    return jsonify([c.to_dict() for c in complaints])
+    # Filtering and pagination
+    q = Complaint.query
+
+    # simple exact filters
+    status = request.args.get('status')
+    department = request.args.get('department')
+    train_number = request.args.get('train_number')
+    coach = request.args.get('coach')
+    if status:
+        q = q.filter(Complaint.status == status)
+    if department:
+        q = q.filter(Complaint.department == department)
+    if train_number:
+        q = q.filter(Complaint.train_number == train_number)
+    if coach:
+        q = q.filter(Complaint.coach == coach)
+
+    # text search across description and summary
+    search = request.args.get('search')
+    if search:
+        like = f"%{search}%"
+        q = q.filter((Complaint.description.ilike(like)) | (Complaint.summary.ilike(like)))
+
+    # date range filtering (ISO format)
+    date_from = request.args.get('from')
+    date_to = request.args.get('to')
+    try:
+        if date_from:
+            dt_from = datetime.fromisoformat(date_from)
+            q = q.filter(Complaint.created_at >= dt_from)
+        if date_to:
+            dt_to = datetime.fromisoformat(date_to)
+            q = q.filter(Complaint.created_at <= dt_to)
+    except Exception:
+        # ignore parse errors and return full set
+        pass
+
+    # pagination
+    try:
+        limit = int(request.args.get('limit', 50))
+    except Exception:
+        limit = 50
+    try:
+        offset = int(request.args.get('offset', 0))
+    except Exception:
+        offset = 0
+
+    total = q.count()
+    complaints = q.order_by(Complaint.created_at.desc()).limit(limit).offset(offset).all()
+
+    return jsonify({
+        'results': [c.to_dict() for c in complaints],
+        'total': total,
+        'limit': limit,
+        'offset': offset,
+    })
+
+
+@app.route('/api/complaints/recurring', methods=['GET'])
+def recurring_groups():
+    """Return grouped/recurring complaint summaries by `group_key`.
+
+    Query params: `limit` and `offset` for paging groups.
+    """
+    # pagination for groups
+    try:
+        limit = int(request.args.get('limit', 50))
+    except Exception:
+        limit = 50
+    try:
+        offset = int(request.args.get('offset', 0))
+    except Exception:
+        offset = 0
+
+    # aggregate counts per group_key
+    grp_q = db.session.query(
+        Complaint.group_key.label('group_key'),
+        func.count(Complaint.id).label('count'),
+        func.max(Complaint.created_at).label('latest_created_at'),
+        func.min(Complaint.id).label('sample_id'),
+    ).group_by(Complaint.group_key).order_by(text('count DESC'))
+
+    total_groups = grp_q.count()
+    groups = grp_q.limit(limit).offset(offset).all()
+
+    result = []
+    for g in groups:
+        sample = Complaint.query.get(g.sample_id)
+        result.append({
+            'group_key': g.group_key,
+            'count': g.count,
+            'latest_created_at': g.latest_created_at.isoformat() if g.latest_created_at else None,
+            'sample_id': g.sample_id,
+            'sample_summary': sample.summary if sample else None,
+            'sample_train_number': sample.train_number if sample else None,
+            'sample_coach': sample.coach if sample else None,
+        })
+
+    return jsonify({
+        'results': result,
+        'total_groups': total_groups,
+        'limit': limit,
+        'offset': offset,
+    })
 
 
 @app.route('/api/complaints/<int:cid>', methods=['GET'])

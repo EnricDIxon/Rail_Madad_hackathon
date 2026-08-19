@@ -1,0 +1,44 @@
+# Environment
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.pyc
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# Node / frontend
+node_modules/
+dist/
+build/
+
+# Uploads / temporary files
+uploads/
+tmp/
+*.log
+
+# IDEs and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.coverage
+coverage/
+
+# Packaging
+*.egg-info/
+pip-wheel-metadata/
